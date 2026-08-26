@@ -1,0 +1,7 @@
+.rlenv/
+__pycache__/
+*.py[cod]
+.Python
+.env
+.venv/
+venv/

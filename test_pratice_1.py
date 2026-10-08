@@ -200,5 +200,79 @@ class GpuTests(unittest.TestCase):
         s.run_all()
 
 
+class CancelTests(unittest.TestCase):
+
+    def test_cancel_running_job_raises_and_job_still_finishes(self):
+        s, release = Scheduler(gpus=1), threading.Event()
+        s.submit("a", lambda: (release.wait(2), "done")[1])
+        s.run_next()
+        with self.assertRaises(RuntimeError):
+            s.cancel("a")
+        self.assertEqual(s.status("a"), "running")
+        release.set()
+        s.run_all()
+        self.assertEqual(s.result("a"), "done")
+
+    def test_cancel_pending_job_never_runs_and_skips_dependents(self):
+        s, order = Scheduler(gpus=1), []
+        s.submit("dep", recorder(order, "dep"))
+        s.submit("p", recorder(order, "p"), depends_on=["dep"])
+        s.submit("child", recorder(order, "child"), depends_on=["p"])
+        self.assertEqual(s.status("p"), "pending")
+
+        s.cancel("p")
+        self.assertEqual(s.status("p"), "cancelled")  # reported immediately
+        s.run_all()
+
+        self.assertEqual(order, ["dep"])  # its own dependency still runs
+        self.assertEqual(s.status("p"), "cancelled")
+        self.assertEqual(s.status("child"), "skipped")
+        with self.assertRaises(RuntimeError):
+            s.result("p")
+
+    def test_cancel_ready_job_is_passed_over_by_run_next(self):
+        s, order = Scheduler(gpus=1), []
+        s.submit("top", recorder(order, "top"), priority=10)
+        s.submit("next", recorder(order, "next"), priority=1)
+        s.submit("child", recorder(order, "child"), depends_on=["top"])
+        s.cancel("top")
+        self.assertEqual(s.run_next(), "next")  # cancelled entry dropped lazily
+        s.run_all()
+        self.assertEqual(order, ["next"])
+        self.assertEqual(s.status("child"), "skipped")
+
+    def test_cancel_only_ready_job_leaves_nothing_to_run(self):
+        s = Scheduler(gpus=1)
+        s.submit("a", lambda: None)
+        s.cancel("a")
+        self.assertIsNone(s.run_next())
+        self.assertEqual(s.status("a"), "cancelled")
+
+    def test_cancel_finished_jobs_is_noop(self):
+        s = Scheduler(gpus=1)
+        s.submit("ok", lambda: 7)
+        s.submit("bad", lambda: 1 / 0)
+        s.submit("skipped", lambda: None, depends_on=["bad"])
+        s.run_all()
+        for job_id in ["ok", "bad", "skipped"]:
+            s.cancel(job_id)
+        self.assertEqual(s.status("ok"), "succeeded")
+        self.assertEqual(s.result("ok"), 7)
+        self.assertEqual(s.status("bad"), "failed")
+        self.assertEqual(s.status("skipped"), "skipped")
+
+    def test_cancel_twice_is_noop(self):
+        s = Scheduler(gpus=1)
+        s.submit("a", lambda: None)
+        s.cancel("a")
+        s.cancel("a")
+        s.run_all()
+        self.assertEqual(s.status("a"), "cancelled")
+
+    def test_cancel_unknown_job_raises(self):
+        with self.assertRaises(KeyError):
+            Scheduler(gpus=1).cancel("nope")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,7 @@ RUNNING = "running"
 SUCCEEDED = "succeeded"
 FAILED = "failed"
 SKIPPED = "skipped"
+CANCELLED = "cancelled"
 
 
 class Scheduler:
@@ -41,6 +42,10 @@ class Scheduler:
         self._ready: list[tuple[int, int, str]] = []
         self._seq = itertools.count()
 
+        # Jobs cancelled by the user. Cancellation is lazy: the heap entry is
+        # left in place and dropped when it reaches the top in run_next.
+        self._cancelled: set[str] = set()
+
     def submit(self, job_id: str, fn: Callable[[], Any], priority: int = 0,
                depends_on: list[str] | None = None, max_retries: int = 0) -> None:
         deps = list(dict.fromkeys(depends_on or []))  # dedupe, keep order
@@ -49,6 +54,7 @@ class Scheduler:
             raise ValueError(f"duplicate job id: {job_id!r}")
         if job_id in deps:
             raise ValueError(f"job {job_id!r} cannot depend on itself")
+        # O(D)
         unknown = [d for d in deps if d not in self._status]
         if unknown:
             raise ValueError(f"job {job_id!r} has unknown dependencies: {unknown}")
@@ -56,7 +62,7 @@ class Scheduler:
             raise ValueError("max_retries must be >= 0")
         # Cycles: every dependency must already be submitted, and a job can't
         # be edited after submission, so no new edge can ever close a cycle.
-
+        
         self._fns[job_id] = fn
         self._priority[job_id] = priority
         self._retries[job_id] = (0, max_retries)
@@ -66,18 +72,37 @@ class Scheduler:
         if any(self._status[d] in (FAILED, SKIPPED) for d in deps):
             self._skip(job_id)
             return
-
+        # O(D)
         unfinished = [d for d in deps if self._status[d] != SUCCEEDED]
         for d in unfinished:
             self._dependents[d].append(job_id)
         self._waiting_on[job_id] = len(unfinished)
+        # O(logN)
         if not unfinished:
             self._enqueue(job_id)
 
+    def cancel(self, job_id: str) -> None:
+        status = self.status(job_id)
+        if status == RUNNING:
+            raise RuntimeError(f"cannot cancel running job {job_id!r}")
+        if status in (PENDING, READY):
+            self._cancelled.add(job_id)
+        # Already finished (succeeded/failed/skipped/cancelled): no-op.
+
     def run_next(self) -> str | None:
-        if not self._ready:
+        # Pop past any cancelled entries; each one is finalized here and its
+        # dependents skipped. A pending job that was cancelled gets enqueued
+        # normally once its deps succeed, then is dropped here.
+        while self._ready:
+            # O(logN)
+            _, _, job_id = heapq.heappop(self._ready)
+            if job_id not in self._cancelled:
+                break
+            self._status[job_id] = CANCELLED
+            for child in self._dependents[job_id]:
+                self._skip(child)
+        else:
             return None
-        _, _, job_id = heapq.heappop(self._ready)
 
         self._status[job_id] = RUNNING
         try:
@@ -109,6 +134,9 @@ class Scheduler:
     def status(self, job_id: str) -> str:
         if job_id not in self._status:
             raise KeyError(job_id)
+        # Report cancellation immediately, even before the lazy cleanup runs.
+        if job_id in self._cancelled:
+            return CANCELLED
         return self._status[job_id]
 
     def result(self, job_id: str) -> Any:
